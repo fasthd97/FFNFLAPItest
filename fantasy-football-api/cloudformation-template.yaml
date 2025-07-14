@@ -1,0 +1,496 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Fantasy Football Data Pipeline with RDS, Lambda, and EventBridge'
+
+Parameters:
+  UpdateFrequency:
+    Type: String
+    Default: 'Weekly'
+    AllowedValues:
+      - 'Daily'
+      - 'Weekly'
+      - 'BiWeekly'
+    Description: 'How often to scrape and update fantasy data'
+  
+  DatabasePassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: 'Password for RDS PostgreSQL database'
+    Default: 'FantasyFootball2024!'
+  
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - 'dev'
+      - 'prod'
+    Description: 'Environment name'
+  
+  SportsDataApiKey:
+    Type: String
+    NoEcho: true
+    Description: 'SportsData.io API key for NFL data (get free at https://sportsdata.io/)'
+    Default: 'your-api-key-here'
+
+Mappings:
+  FrequencyToSchedule:
+    Daily:
+      Expression: 'rate(1 day)'
+    Weekly:
+      Expression: 'rate(7 days)'
+    BiWeekly:
+      Expression: 'rate(14 days)'
+
+Resources:
+  # KMS Key for encryption
+  FantasyDataKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS Key for Fantasy Football data encryption'
+      KeyPolicy:
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow RDS and Lambda access
+            Effect: Allow
+            Principal:
+              Service:
+                - rds.amazonaws.com
+                - lambda.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+            Resource: '*'
+
+  FantasyDataKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/fantasy-football-${Environment}'
+      TargetKeyId: !Ref FantasyDataKey
+
+  # VPC and Security Groups
+  FantasyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: '10.0.0.0/16'
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'fantasy-football-vpc-${Environment}'
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref FantasyVPC
+      CidrBlock: '10.0.1.0/24'
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub 'fantasy-private-subnet-1-${Environment}'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref FantasyVPC
+      CidrBlock: '10.0.2.0/24'
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub 'fantasy-private-subnet-2-${Environment}'
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: 'Subnet group for Fantasy Football RDS'
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub 'fantasy-db-subnet-group-${Environment}'
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for Fantasy Football RDS'
+      VpcId: !Ref FantasyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub 'fantasy-db-sg-${Environment}'
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for Fantasy Football Lambda'
+      VpcId: !Ref FantasyVPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: !Sub 'fantasy-lambda-sg-${Environment}'
+
+  # RDS PostgreSQL Database
+  FantasyDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub 'fantasy-football-db-${Environment}'
+      DBInstanceClass: 'db.t3.micro'
+      Engine: 'postgres'
+      EngineVersion: '15.8'
+      AllocatedStorage: 20
+      StorageType: 'gp2'
+      StorageEncrypted: true
+      KmsKeyId: !Ref FantasyDataKey
+      MasterUsername: 'fantasy_admin'
+      MasterUserPassword: !Ref DatabasePassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      BackupRetentionPeriod: 7
+      MultiAZ: false
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub 'fantasy-football-db-${Environment}'
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: FantasyFootballLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:GenerateDataKey'
+                Resource: !GetAtt FantasyDataKey.Arn
+              - Effect: Allow
+                Action:
+                  - 'rds:DescribeDBInstances'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource: !Ref DatabaseSecret
+
+  # Secrets Manager for DB credentials
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub 'fantasy-football-db-credentials-${Environment}'
+      Description: 'Database credentials for Fantasy Football'
+      KmsKeyId: !Ref FantasyDataKey
+      SecretString: !Sub |
+        {
+          "username": "fantasy_admin",
+          "password": "${DatabasePassword}",
+          "host": "${FantasyDatabase.Endpoint.Address}",
+          "port": 5432,
+          "database": "postgres"
+        }
+
+  # Lambda Layer for dependencies
+  PsycopgLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      Content:
+        S3Bucket: !Sub 'fantasy-lambda-layers-${AWS::Region}-${AWS::AccountId}'
+        S3Key: 'psycopg2-layer.zip'
+      LayerName: !Sub 'fantasy-dependencies-${Environment}'
+      Description: 'PostgreSQL adapter and BeautifulSoup for Python'
+      CompatibleRuntimes:
+        - python3.11
+
+  # Lambda Function for scraping
+  FantasyScraperFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'fantasy-football-scraper-${Environment}'
+      Runtime: 'python3.11'
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          DB_SECRET_ARN: !Ref DatabaseSecret
+          ENVIRONMENT: !Ref Environment
+          SPORTSDATA_API_KEY: !Ref SportsDataApiKey
+      Layers:
+        - arn:aws:lambda:us-west-2:336392948345:layer:AWSSDKPandas-Python311:13
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import requests
+          from bs4 import BeautifulSoup
+          from urllib.robotparser import RobotFileParser
+          from urllib.parse import urlparse
+          import time
+          import re
+          import os
+          
+          class FantasyScraperLambda:
+              def __init__(self):
+                  self.session = requests.Session()
+                  self.session.headers.update({
+                      'User-Agent': 'Mozilla/5.0 (compatible; FantasyScraper/1.0)'
+                  })
+              
+              def can_crawl(self, url):
+                  try:
+                      parsed_url = urlparse(url)
+                      robots_url = f"{parsed_url.scheme}://{parsed_url.netloc}/robots.txt"
+                      rp = RobotFileParser()
+                      rp.set_url(robots_url)
+                      rp.read()
+                      return rp.can_fetch('*', url)
+                  except:
+                      return False
+              
+              def extract_players_with_stats(self, soup, url):
+                  players = []
+                  tables = soup.find_all('table')
+                  for table in tables:
+                      rows = table.find_all('tr')
+                      for row in rows[1:]:
+                          cells = row.find_all(['td', 'th'])
+                          if len(cells) < 3:
+                              continue
+                          player = {'source_url': url}
+                          # Extract player name
+                          for cell in cells[:3]:
+                              text = cell.get_text(strip=True)
+                              if len(text) > 3 and not text.isupper() and not text.isdigit():
+                                  player['name'] = text
+                                  break
+                          # Extract team
+                          for cell in cells:
+                              text = cell.get_text(strip=True)
+                              if len(text) == 3 and text.isupper():
+                                  player['team'] = text
+                                  break
+                          # Extract position
+                          for cell in cells:
+                              text = cell.get_text(strip=True)
+                              if text in ['QB', 'RB', 'WR', 'TE', 'K', 'DEF', 'DST']:
+                                  player['position'] = text
+                                  break
+                          # Extract stats
+                          stats = {}
+                          for cell in cells:
+                              text = cell.get_text(strip=True)
+                              if text.replace('.', '').replace('-', '').isdigit():
+                                  stats[f'stat_{len(stats)}'] = float(text)
+                          player['stats'] = stats
+                          if player.get('name'):
+                              players.append(player)
+                  return players
+              
+              def scrape_url(self, url):
+                  if not self.can_crawl(url):
+                      print(f"Cannot crawl {url} - robots.txt disallows")
+                      return []
+                  try:
+                      response = self.session.get(url, timeout=15)
+                      response.raise_for_status()
+                      soup = BeautifulSoup(response.content, 'html.parser')
+                      players = self.extract_players_with_stats(soup, url)
+                      print(f"Extracted {len(players)} players from {url}")
+                      return players
+                  except Exception as e:
+                      print(f"Error scraping {url}: {e}")
+                      return []
+              
+              def get_db_connection(self, secret_arn):
+                  secrets_client = boto3.client('secretsmanager')
+                  secret_response = secrets_client.get_secret_value(SecretId=secret_arn)
+                  db_creds = json.loads(secret_response['SecretString'])
+                  return psycopg2.connect(
+                      host=db_creds['host'],
+                      database=db_creds['database'],
+                      user=db_creds['username'],
+                      password=db_creds['password'],
+                      port=db_creds['port']
+                  )
+              
+              def create_tables(self, conn):
+                  tables_sql = """
+                  CREATE TABLE IF NOT EXISTS players (
+                      id SERIAL PRIMARY KEY,
+                      name VARCHAR(100) NOT NULL,
+                      team VARCHAR(3),
+                      position VARCHAR(5),
+                      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                      UNIQUE(name, team)
+                  );
+                  CREATE TABLE IF NOT EXISTS games (
+                      id SERIAL PRIMARY KEY,
+                      week INTEGER NOT NULL,
+                      year INTEGER NOT NULL,
+                      game_date DATE,
+                      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                      UNIQUE(week, year)
+                  );
+                  CREATE TABLE IF NOT EXISTS player_stats (
+                      id SERIAL PRIMARY KEY,
+                      player_id INTEGER REFERENCES players(id),
+                      game_id INTEGER REFERENCES games(id),
+                      fantasy_points DECIMAL(5,2) DEFAULT 0,
+                      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                      UNIQUE(player_id, game_id)
+                  );
+                  """
+                  cursor = conn.cursor()
+                  cursor.execute(tables_sql)
+                  conn.commit()
+                  cursor.close()
+              
+              def save_players_to_db(self, conn, players, week, year):
+                  cursor = conn.cursor()
+                  cursor.execute("""
+                      INSERT INTO games (week, year, game_date) 
+                      VALUES (%s, %s, CURRENT_DATE)
+                      ON CONFLICT (week, year) DO UPDATE SET game_date = EXCLUDED.game_date
+                      RETURNING id;
+                  """, (week, year))
+                  game_id = cursor.fetchone()[0]
+                  success_count = 0
+                  for player in players:
+                      try:
+                          cursor.execute("""
+                              INSERT INTO players (name, team, position) 
+                              VALUES (%s, %s, %s)
+                              ON CONFLICT (name, team) DO UPDATE SET position = EXCLUDED.position
+                              RETURNING id;
+                          """, (player.get('name', ''), player.get('team', ''), player.get('position', '')))
+                          player_id = cursor.fetchone()[0]
+                          if player.get('stats'):
+                              stats = player['stats']
+                              cursor.execute("""
+                                  INSERT INTO player_stats (player_id, game_id, fantasy_points) 
+                                  VALUES (%s, %s, %s)
+                                  ON CONFLICT (player_id, game_id) 
+                                  DO UPDATE SET fantasy_points = EXCLUDED.fantasy_points, updated_at = CURRENT_TIMESTAMP;
+                              """, (player_id, game_id, stats.get('stat_0', 0)))
+                          success_count += 1
+                      except Exception as e:
+                          print(f"Error saving player {player.get('name', 'Unknown')}: {e}")
+                          continue
+                  conn.commit()
+                  cursor.close()
+                  return success_count
+          
+          def lambda_handler(event, context):
+              print("Fantasy Football scraper started")
+              secret_arn = os.environ['DB_SECRET_ARN']
+              urls_param = os.environ.get('SCRAPE_URLS', 'https://www.pro-football-reference.com/years/2024/fantasy.htm')
+              urls = [url.strip() for url in urls_param.split(',')]
+              current_week = event.get('week', 1)
+              current_year = event.get('year', 2024)
+              scraper = FantasyScraperLambda()
+              all_players = []
+              for url in urls:
+                  players = scraper.scrape_url(url)
+                  all_players.extend(players)
+                  time.sleep(2)
+              if not all_players:
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('No players found from any URL')
+                  }
+              try:
+                  conn = scraper.get_db_connection(secret_arn)
+                  scraper.create_tables(conn)
+                  saved_count = scraper.save_players_to_db(conn, all_players, current_week, current_year)
+                  conn.close()
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully processed {saved_count} players',
+                          'urls_scraped': len(urls),
+                          'total_players_found': len(all_players)
+                      })
+                  }
+              except Exception as e:
+                  print(f"Database error: {e}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Database error: {str(e)}')
+                  }
+
+  # EventBridge Rule for scheduling
+  FantasyScraperSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'fantasy-football-schedule-${Environment}'
+      Description: !Sub 'Trigger fantasy football scraper ${UpdateFrequency}'
+      ScheduleExpression: !FindInMap [FrequencyToSchedule, !Ref UpdateFrequency, Expression]
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt FantasyScraperFunction.Arn
+          Id: 'FantasyScraperTarget'
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FantasyScraperFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt FantasyScraperSchedule.Arn
+
+Outputs:
+  DatabaseEndpoint:
+    Description: 'RDS PostgreSQL endpoint'
+    Value: !GetAtt FantasyDatabase.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-db-endpoint'
+  
+  DatabaseSecretArn:
+    Description: 'ARN of the database credentials secret'
+    Value: !Ref DatabaseSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-db-secret'
+  
+  LambdaFunctionArn:
+    Description: 'ARN of the Fantasy Football scraper Lambda function'
+    Value: !GetAtt FantasyScraperFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-lambda-arn'
+  
+  KMSKeyId:
+    Description: 'KMS Key ID for encryption'
+    Value: !Ref FantasyDataKey
+    Export:
+      Name: !Sub '${AWS::StackName}-kms-key'
